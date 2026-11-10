@@ -1,8 +1,8 @@
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -31,6 +31,102 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def get_session_id(x_session_id: str = Header(...)) -> str:
+    """브라우저가 만든 익명 장바구니 ID (로그인 없이 장바구니 구분용)"""
+    if not 8 <= len(x_session_id) <= 64:
+        raise HTTPException(status_code=400, detail="invalid session id")
+    return x_session_id
+
+
+def db_call(fn):
+    try:
+        return fn()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"database error: {type(e).__name__}")
+
+
+def cart_response(session_id: str):
+    res = db_call(
+        lambda: sb.table("cart_items")
+        .select("id, quantity, product:products(id, name, price, emoji)")
+        .eq("session_id", session_id)
+        .order("id")
+        .execute()
+    )
+    items = res.data
+    total = sum(i["quantity"] * i["product"]["price"] for i in items)
+    return {"items": items, "total": total, "count": sum(i["quantity"] for i in items)}
+
+
+class AddItem(BaseModel):
+    product_id: int
+    quantity: int = Field(default=1, ge=1, le=99)
+
+
+class SetQuantity(BaseModel):
+    quantity: int = Field(ge=0, le=99)
+
+
+@app.get("/products")
+def list_products():
+    res = db_call(lambda: sb.table("products").select("*").order("id").execute())
+    return res.data
+
+
+@app.get("/cart")
+def get_cart(session_id: str = Depends(get_session_id)):
+    return cart_response(session_id)
+
+
+@app.post("/cart")
+def add_to_cart(body: AddItem, session_id: str = Depends(get_session_id)):
+    exist = db_call(
+        lambda: sb.table("cart_items").select("id, quantity")
+        .eq("session_id", session_id).eq("product_id", body.product_id).execute()
+    ).data
+    if exist:
+        qty = min(99, exist[0]["quantity"] + body.quantity)
+        db_call(lambda: sb.table("cart_items").update({"quantity": qty}).eq("id", exist[0]["id"]).execute())
+    else:
+        prod = db_call(lambda: sb.table("products").select("id").eq("id", body.product_id).execute()).data
+        if not prod:
+            raise HTTPException(status_code=404, detail="product not found")
+        db_call(
+            lambda: sb.table("cart_items")
+            .insert({"session_id": session_id, "product_id": body.product_id, "quantity": body.quantity})
+            .execute()
+        )
+    return cart_response(session_id)
+
+
+@app.patch("/cart/{product_id}")
+def set_quantity(product_id: int, body: SetQuantity, session_id: str = Depends(get_session_id)):
+    q = sb.table("cart_items")
+    if body.quantity == 0:
+        db_call(lambda: q.delete().eq("session_id", session_id).eq("product_id", product_id).execute())
+    else:
+        db_call(
+            lambda: q.update({"quantity": body.quantity})
+            .eq("session_id", session_id).eq("product_id", product_id).execute()
+        )
+    return cart_response(session_id)
+
+
+@app.delete("/cart/{product_id}")
+def remove_item(product_id: int, session_id: str = Depends(get_session_id)):
+    db_call(
+        lambda: sb.table("cart_items").delete()
+        .eq("session_id", session_id).eq("product_id", product_id).execute()
+    )
+    return cart_response(session_id)
+
+
+@app.delete("/cart")
+def clear_cart(session_id: str = Depends(get_session_id)):
+    db_call(lambda: sb.table("cart_items").delete().eq("session_id", session_id).execute())
+    return cart_response(session_id)
 
 
 @app.get("/supabase/health")
